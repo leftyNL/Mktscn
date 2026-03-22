@@ -3,7 +3,7 @@ import requests
 import pandas as pd
 
 # YOUR SHARED SERVER URL
-BASE_PROXY_URL = "https://carstens.de/proxy/proxy.php" 
+BASE_PROXY_URL = "https://carstens.de/Proxy/proxy.php" 
 
 def get_data_from_proxy(store, query):
     try:
