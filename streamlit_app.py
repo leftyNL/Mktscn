@@ -1,119 +1,117 @@
 import streamlit as st
 import requests
 import pandas as pd
-import subprocess
+import random
 from playwright.sync_api import sync_playwright
 
-# --- 1. SYSTEM SETUP ---
-@st.cache_resource
-def install_browsers():
-    try:
-        # This installs the necessary browser engine on Streamlit's server
-        subprocess.run(["playwright", "install", "chromium"])
-        return True
-    except:
-        return False
+# --- 1. CONFIG & HEADERS ---
+USER_AGENTS = [
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+]
 
-install_browsers()
-
-# --- 2. THE STEALTH SCRAPERS ---
+# --- 2. SCRAPERS WITH DEBUGGING ---
 
 def get_ah_data(query):
-    """2026 Stealth Version for Albert Heijn"""
+    log = {"store": "AH", "status": "Initiating"}
     try:
-        # AH requires these exact headers to not return a 401/403 error
+        # Step A: Anonymous Auth
         auth_url = "https://api.ah.nl/mobile-auth/v1/auth/token/anonymous"
-        token_res = requests.post(auth_url, json={"clientId": "appie"}).json()
-        token = token_res.get("access_token")
+        token_res = requests.post(auth_url, json={"clientId": "appie"}, timeout=5)
+        if token_res.status_code != 200:
+            return {"Price": "N/A", "Status": f"Auth Fail ({token_res.status_code})"}, f"AH Auth Failed: {token_res.text}"
         
+        token = token_res.json().get("access_token")
+        
+        # Step B: Search
         search_url = f"https://api.ah.nl/mobile-services/product/search/v2?query={query}"
         headers = {
             "Authorization": f"Bearer {token}",
             "X-Application": "nl.ah.mobile.consumer.app",
-            "User-Agent": "Appie/8.22.3",
-            "Content-Type": "application/json",
-            "Accept": "application/json"
+            "User-Agent": random.choice(USER_AGENTS)
         }
         
-        res = requests.get(search_url, headers=headers, timeout=10).json()
-        if not res.get('products'): return {"Price": "N/A", "Status": "No Match"}
+        res = requests.get(search_url, headers=headers, timeout=10)
+        if res.status_code != 200:
+            return {"Price": "N/A", "Status": f"Block ({res.status_code})"}, f"AH Search Blocked: {res.status_code}"
             
-        product = res['products'][0]
-        price = product['currentPrice']
-        
-        return {
-            "Price": f"€{price:.2f}",
-            "Status": "🔥 BONUS" if product.get('isBonus') else "Regular"
-        }
+        data = res.json()
+        if not data.get('products'):
+            return {"Price": "N/A", "Status": "Empty Results"}, "AH returned 0 products for this search."
+            
+        product = data['products'][0]
+        return {"Price": f"€{product['currentPrice']:.2f}", "Status": "Success"}, "AH: OK"
     except Exception as e:
-        return {"Price": "Blocked", "Status": "Check API"}
+        return {"Price": "Err", "Status": "System Error"}, f"AH Exception: {str(e)}"
 
 def get_jumbo_data(query):
-    """2026 Stealth Version for Jumbo (Playwright)"""
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            # Mimic a modern iPhone to bypass bot detection
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
-            )
+            context = browser.new_context(user_agent=random.choice(USER_AGENTS))
             page = context.new_page()
-            page.goto(f"https://www.jumbo.com/zoeken?searchTerms={query}", wait_until="domcontentloaded")
             
-            # 1. Click the Cookie Consent if it blocks the view
-            try:
-                page.click("button#onetrust-accept-btn-handler", timeout=3000)
-            except:
-                pass 
+            # Go to search
+            response = page.goto(f"https://www.jumbo.com/zoeken?searchTerms={query}", wait_until="networkidle")
+            
+            if response.status != 200:
+                browser.close()
+                return {"Price": "N/A", "Status": "Blocked"}, f"Jumbo Blocked: {response.status}"
 
-            # 2. Extract Price (Jumbo split prices into Euro and Cents)
-            page.wait_for_selector(".whole-number", timeout=8000)
+            # Accept Cookies
+            try: page.click("button#onetrust-accept-btn-handler", timeout=3000)
+            except: pass
+
+            # Scrape
+            page.wait_for_selector(".whole-number", timeout=7000)
             euro = page.locator(".whole-number").first.inner_text()
             cents = page.locator(".fractional-number").first.inner_text()
             
-            # 3. Check for discount labels
-            is_promo = page.locator(".product-price__discount").count() > 0
-            
             browser.close()
-            return {"Price": f"€{euro}.{cents}", "Status": "🔥 SALE" if is_promo else "Regular"}
-    except:
-        return {"Price": "N/A", "Status": "Timeout"}
+            return {"Price": f"€{euro}.{cents}", "Status": "Success"}, "Jumbo: OK"
+    except Exception as e:
+        return {"Price": "N/A", "Status": "Timeout"}, f"Jumbo Error: {str(e)}"
 
-# --- 3. THE INTERFACE ---
+# --- 3. UI ---
+st.title("🛒 NL Price Tracker (v1.2 Debug)")
 
-st.set_page_config(page_title="Price Scout", page_icon="🛍️")
-st.title("🛍️ Dutch Price Scout")
+if 'watchlist' not in st.session_state:
+    st.session_state.watchlist = []
+if 'debug_logs' not in st.session_state:
+    st.session_state.debug_logs = []
 
-if 'list' not in st.session_state:
-    st.session_state.list = []
-
-# Input
-with st.form("add_form", clear_on_submit=True):
-    new_item = st.text_input("Product Name", placeholder="e.g. 'Heineken 6-pack' or 'Zaanse Hoeve Melk'")
-    if st.form_submit_button("Add to Comparison"):
-        if new_item:
-            st.session_state.list.append(new_item)
-            st.rerun()
-
-# Table
-if st.session_state.list:
-    results = []
-    with st.spinner("Scouting prices..."):
-        for item in st.session_state.list:
-            ah = get_ah_data(item)
-            jumbo = get_jumbo_data(item)
-            results.append({
-                "Product": item,
-                "Albert Heijn": ah['Price'],
-                "AH Info": ah['Status'],
-                "Jumbo": jumbo['Price'],
-                "Jumbo Info": jumbo['Status']
-            })
-    
-    st.table(pd.DataFrame(results))
-    
-    if st.button("Clear List"):
-        st.session_state.list = []
+# Sidebar for management
+with st.sidebar:
+    item = st.text_input("Add product:")
+    if st.button("Add"):
+        st.session_state.watchlist.append(item)
         st.rerun()
-else:
-    st.info("Enter a product above to compare prices.")
+    if st.button("Clear Logs"):
+        st.session_state.debug_logs = []
+        st.rerun()
+
+# Comparison Table
+if st.session_state.watchlist:
+    display_list = []
+    st.session_state.debug_logs = [] # Reset logs for this run
+    
+    for product in st.session_state.watchlist:
+        ah_res, ah_log = get_ah_data(product)
+        jumbo_res, jumbo_log = get_jumbo_data(product)
+        
+        st.session_state.debug_logs.append(ah_log)
+        st.session_state.debug_logs.append(jumbo_log)
+        
+        display_list.append({
+            "Product": product,
+            "Albert Heijn": ah_res['Price'],
+            "Jumbo": jumbo_res['Price']
+        })
+    
+    st.table(pd.DataFrame(display_list))
+    
+    # DEBUG SECTION
+    with st.expander("🛠️ Technical Debug Logs (Why it might be failing)"):
+        for log in st.session_state.debug_logs:
+            st.text(log)
